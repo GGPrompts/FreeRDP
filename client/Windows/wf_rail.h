@@ -25,6 +25,25 @@ typedef struct wf_rail_window wfRailWindow;
 
 #include <freerdp/client/rail.h>
 
+struct wf_rail_window
+{
+	wfContext* wfc;
+
+	HWND hWnd;
+	UINT32 windowId;
+
+	DWORD dwStyle;
+	DWORD dwExStyle;
+
+	int x;
+	int y;
+	int width;
+	int height;
+	char* title;
+
+	BOOL isLocalMoveSizing; /* TRUE while DWM is handling a local move/resize */
+};
+
 BOOL wf_rail_init(wfContext* wfc, RailClientContext* rail);
 void wf_rail_uninit(wfContext* wfc, RailClientContext* rail);
 
