@@ -30,6 +30,7 @@ struct wf_rail_window
 	wfContext* wfc;
 
 	HWND hWnd;
+	UINT32 windowId;
 
 	DWORD dwStyle;
 	DWORD dwExStyle;
@@ -39,6 +40,8 @@ struct wf_rail_window
 	int width;
 	int height;
 	char* title;
+
+	BOOL isLocalMoveSizing; /* TRUE while DWM is handling a local move/resize */
 };
 
 BOOL wf_rail_init(wfContext* wfc, RailClientContext* rail);

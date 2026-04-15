@@ -269,6 +269,36 @@ static void PrintRailIconInfo(const WINDOW_ORDER_INFO* orderInfo, const ICON_INF
 	WLog_INFO(TAG, "}");
 }
 
+/* Send the current window rectangle to the RAIL server so the remote
+ * side knows where the window ended up after a local move/resize. */
+static void wf_rail_send_window_move(wfRailWindow* railWindow)
+{
+	RailClientContext* rail;
+	RAIL_WINDOW_MOVE_ORDER windowMove;
+	RECT rc;
+
+	if (!railWindow || !railWindow->wfc)
+		return;
+
+	rail = railWindow->wfc->rail;
+	if (!rail || !rail->ClientWindowMove)
+		return;
+
+	GetWindowRect(railWindow->hWnd, &rc);
+	windowMove.windowId = railWindow->windowId;
+	windowMove.left = (INT16)rc.left;
+	windowMove.top = (INT16)rc.top;
+	windowMove.right = (INT16)rc.right;
+	windowMove.bottom = (INT16)rc.bottom;
+	rail->ClientWindowMove(rail, &windowMove);
+
+	/* Keep the local tracking in sync. */
+	railWindow->x = rc.left;
+	railWindow->y = rc.top;
+	railWindow->width = rc.right - rc.left;
+	railWindow->height = rc.bottom - rc.top;
+}
+
 LRESULT CALLBACK wf_RailWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
 	HDC hDC;
@@ -296,6 +326,37 @@ LRESULT CALLBACK wf_RailWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 
 	switch (msg)
 	{
+		/* ── Snap / DWM integration ────────────────────────────── */
+
+		case WM_NCCALCSIZE:
+			/* We keep WS_THICKFRAME so DWM offers snap layouts, but
+			 * suppress the visible non-client frame by returning 0.
+			 * The server renders its own decorations. */
+			if (wParam == TRUE)
+				return 0;
+			return DefWindowProc(hWnd, msg, wParam, lParam);
+
+		case WM_ENTERSIZEMOVE:
+			if (railWindow)
+				railWindow->isLocalMoveSizing = TRUE;
+			return 0;
+
+		case WM_EXITSIZEMOVE:
+			if (railWindow)
+			{
+				railWindow->isLocalMoveSizing = FALSE;
+				wf_rail_send_window_move(railWindow);
+			}
+			return 0;
+
+		case WM_WINDOWPOSCHANGED:
+			/* During a local move/resize DWM may snap the window.
+			 * Forward intermediate position updates so the server
+			 * re-renders at the correct size in real time. */
+			if (railWindow && railWindow->isLocalMoveSizing)
+				wf_rail_send_window_move(railWindow);
+			return DefWindowProc(hWnd, msg, wParam, lParam);
+
 		case WM_PAINT:
 		{
 			if (!wfc)
@@ -400,8 +461,11 @@ LRESULT CALLBACK wf_RailWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 	return 0;
 }
 
-#define RAIL_DISABLED_WINDOW_STYLES                                                      \
-	(WS_BORDER | WS_THICKFRAME | WS_DLGFRAME | WS_CAPTION | WS_OVERLAPPED | WS_VSCROLL | \
+/* WS_THICKFRAME is intentionally kept: DWM requires it for snap layouts
+ * (drag-to-edge, Win11 Snap Layouts). We suppress the visible resize frame
+ * by handling WM_NCCALCSIZE to return a zero-size non-client area. */
+#define RAIL_DISABLED_WINDOW_STYLES                                                \
+	(WS_BORDER | WS_DLGFRAME | WS_CAPTION | WS_OVERLAPPED | WS_VSCROLL | \
 	 WS_HSCROLL | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX)
 #define RAIL_DISABLED_EXTENDED_WINDOW_STYLES \
 	(WS_EX_DLGMODALFRAME | WS_EX_CLIENTEDGE | WS_EX_STATICEDGE | WS_EX_WINDOWEDGE)
@@ -426,8 +490,15 @@ static BOOL wf_rail_window_common(rdpContext* context, const WINDOW_ORDER_INFO* 
 			return FALSE;
 
 		railWindow->wfc = wfc;
+		railWindow->windowId = orderInfo->windowId;
+		railWindow->isLocalMoveSizing = FALSE;
 		railWindow->dwStyle = windowState->style;
 		railWindow->dwStyle &= ~RAIL_DISABLED_WINDOW_STYLES;
+		/* Re-add WS_THICKFRAME for DWM snap support, but only on
+		 * windows the server originally marked as resizable.  This
+		 * avoids enabling resize/snap on dialogs and tool windows. */
+		if (windowState->style & WS_THICKFRAME)
+			railWindow->dwStyle |= WS_THICKFRAME;
 		railWindow->dwExStyle = windowState->extendedStyle;
 		railWindow->dwExStyle &= ~RAIL_DISABLED_EXTENDED_WINDOW_STYLES;
 		railWindow->x = windowState->windowOffsetX;
@@ -525,20 +596,26 @@ static BOOL wf_rail_window_common(rdpContext* context, const WINDOW_ORDER_INFO* 
 
 	if ((fieldFlags & WINDOW_ORDER_FIELD_WND_OFFSET) || (fieldFlags & WINDOW_ORDER_FIELD_WND_SIZE))
 	{
-		if (fieldFlags & WINDOW_ORDER_FIELD_WND_OFFSET)
+		/* While a local move/resize is active (DWM owns the drag loop),
+		 * suppress server-driven geometry updates to avoid fighting the
+		 * local DWM positioning and prevent feedback loops. */
+		if (!railWindow->isLocalMoveSizing)
 		{
-			railWindow->x = windowState->windowOffsetX;
-			railWindow->y = windowState->windowOffsetY;
-		}
+			if (fieldFlags & WINDOW_ORDER_FIELD_WND_OFFSET)
+			{
+				railWindow->x = windowState->windowOffsetX;
+				railWindow->y = windowState->windowOffsetY;
+			}
 
-		if (fieldFlags & WINDOW_ORDER_FIELD_WND_SIZE)
-		{
-			railWindow->width = windowState->windowWidth;
-			railWindow->height = windowState->windowHeight;
-		}
+			if (fieldFlags & WINDOW_ORDER_FIELD_WND_SIZE)
+			{
+				railWindow->width = windowState->windowWidth;
+				railWindow->height = windowState->windowHeight;
+			}
 
-		SetWindowPos(railWindow->hWnd, NULL, railWindow->x, railWindow->y, railWindow->width,
-		             railWindow->height, 0);
+			SetWindowPos(railWindow->hWnd, NULL, railWindow->x, railWindow->y, railWindow->width,
+			             railWindow->height, 0);
+		}
 	}
 
 	if (fieldFlags & WINDOW_ORDER_FIELD_OWNER)
@@ -549,6 +626,8 @@ static BOOL wf_rail_window_common(rdpContext* context, const WINDOW_ORDER_INFO* 
 	{
 		railWindow->dwStyle = windowState->style;
 		railWindow->dwStyle &= ~RAIL_DISABLED_WINDOW_STYLES;
+		if (windowState->style & WS_THICKFRAME)
+			railWindow->dwStyle |= WS_THICKFRAME; /* DWM snap support */
 		railWindow->dwExStyle = windowState->extendedStyle;
 		railWindow->dwExStyle &= ~RAIL_DISABLED_EXTENDED_WINDOW_STYLES;
 		SetWindowLongPtr(railWindow->hWnd, GWL_STYLE, (LONG)railWindow->dwStyle);
@@ -929,6 +1008,68 @@ static UINT wf_rail_server_handshake_ex(RailClientContext* context,
 static UINT wf_rail_server_local_move_size(RailClientContext* context,
                                            const RAIL_LOCALMOVESIZE_ORDER* localMoveSize)
 {
+	wfContext* wfc = (wfContext*)context->custom;
+	wfRailWindow* railWindow;
+
+	railWindow = (wfRailWindow*)HashTable_GetItemValue(
+	    wfc->railWindows, (void*)(UINT_PTR)localMoveSize->windowId);
+
+	if (!railWindow)
+		return ERROR_INTERNAL_ERROR;
+
+	if (localMoveSize->isMoveSizeStart)
+	{
+		WPARAM sc;
+		railWindow->isLocalMoveSizing = TRUE;
+
+		switch (localMoveSize->moveSizeType)
+		{
+			case RAIL_WMSZ_LEFT:
+				sc = SC_SIZE | WMSZ_LEFT;
+				break;
+			case RAIL_WMSZ_RIGHT:
+				sc = SC_SIZE | WMSZ_RIGHT;
+				break;
+			case RAIL_WMSZ_TOP:
+				sc = SC_SIZE | WMSZ_TOP;
+				break;
+			case RAIL_WMSZ_TOPLEFT:
+				sc = SC_SIZE | WMSZ_TOPLEFT;
+				break;
+			case RAIL_WMSZ_TOPRIGHT:
+				sc = SC_SIZE | WMSZ_TOPRIGHT;
+				break;
+			case RAIL_WMSZ_BOTTOM:
+				sc = SC_SIZE | WMSZ_BOTTOM;
+				break;
+			case RAIL_WMSZ_BOTTOMLEFT:
+				sc = SC_SIZE | WMSZ_BOTTOMLEFT;
+				break;
+			case RAIL_WMSZ_BOTTOMRIGHT:
+				sc = SC_SIZE | WMSZ_BOTTOMRIGHT;
+				break;
+			case RAIL_WMSZ_MOVE:
+			case RAIL_WMSZ_KEYMOVE:
+				sc = SC_MOVE;
+				break;
+			case RAIL_WMSZ_KEYSIZE:
+				sc = SC_SIZE;
+				break;
+			default:
+				return CHANNEL_RC_OK;
+		}
+
+		/* Initiate the system-managed move/resize so DWM takes over
+		 * and can offer snap zones during the drag. */
+		SendMessage(railWindow->hWnd, WM_SYSCOMMAND, sc,
+		            MAKELPARAM(localMoveSize->posX, localMoveSize->posY));
+	}
+	else
+	{
+		railWindow->isLocalMoveSizing = FALSE;
+		wf_rail_send_window_move(railWindow);
+	}
+
 	return CHANNEL_RC_OK;
 }
 
@@ -940,6 +1081,15 @@ static UINT wf_rail_server_local_move_size(RailClientContext* context,
 static UINT wf_rail_server_min_max_info(RailClientContext* context,
                                         const RAIL_MINMAXINFO_ORDER* minMaxInfo)
 {
+	/* TODO: Store the server's min/max constraints on the railWindow
+	 * and apply them in a WM_GETMINMAXINFO handler. For now, accept
+	 * the order and let DWM use its defaults — snap will work but
+	 * the server's size constraints won't be enforced client-side. */
+	WLog_DBG(TAG, "ServerMinMaxInfo: wid=0x%08X max=%dx%d minTrack=%dx%d maxTrack=%dx%d",
+	         minMaxInfo->windowId,
+	         minMaxInfo->maxWidth, minMaxInfo->maxHeight,
+	         minMaxInfo->minTrackWidth, minMaxInfo->minTrackHeight,
+	         minMaxInfo->maxTrackWidth, minMaxInfo->maxTrackHeight);
 	return CHANNEL_RC_OK;
 }
 
