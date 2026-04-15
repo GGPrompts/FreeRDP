@@ -1060,8 +1060,11 @@ static UINT wf_rail_server_local_move_size(RailClientContext* context,
 
 	if (localMoveSize->isMoveSizeStart)
 	{
+		POINT pt;
 		WPARAM sc;
 		railWindow->isLocalMoveSizing = TRUE;
+		pt.x = localMoveSize->posX;
+		pt.y = localMoveSize->posY;
 
 		switch (localMoveSize->moveSizeType)
 		{
@@ -1100,10 +1103,27 @@ static UINT wf_rail_server_local_move_size(RailClientContext* context,
 				return CHANNEL_RC_OK;
 		}
 
+		if ((localMoveSize->moveSizeType != RAIL_WMSZ_KEYMOVE) &&
+		    (localMoveSize->moveSizeType != RAIL_WMSZ_KEYSIZE))
+		{
+			ClientToScreen(railWindow->hWnd, &pt);
+		}
+
 		/* Initiate the system-managed move/resize so DWM takes over
 		 * and can offer snap zones during the drag. */
-		SendMessage(railWindow->hWnd, WM_SYSCOMMAND, sc,
-		            MAKELPARAM(localMoveSize->posX, localMoveSize->posY));
+		if (localMoveSize->moveSizeType == RAIL_WMSZ_MOVE)
+		{
+			/* Bare SC_MOVE is enough for keyboard snapping, but Windows 11's
+			 * drag snap UI expects a real caption drag/non-client move loop. */
+			ReleaseCapture();
+			SendMessage(railWindow->hWnd, WM_NCLBUTTONDOWN, HTCAPTION,
+			            MAKELPARAM((SHORT)pt.x, (SHORT)pt.y));
+		}
+		else
+		{
+			SendMessage(railWindow->hWnd, WM_SYSCOMMAND, sc,
+			            MAKELPARAM((SHORT)pt.x, (SHORT)pt.y));
+		}
 	}
 	else
 	{
